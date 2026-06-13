@@ -1,3 +1,9 @@
+// Tawhiri - Server and downloader
+//
+// Copyright (C) Jean-Michael (DO2JMG) <info@wettersonde.net>
+//
+// Released under GNU GPL v3 or later
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
