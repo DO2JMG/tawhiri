@@ -12,3 +12,14 @@ cd tawhiri
 make
 ```
 
+## Start server
+
+```
+./tawhiri --server --port 8080
+```
+
+## Run downloader 
+
+```
+./tawhiri-downloader 2026061112
+```
