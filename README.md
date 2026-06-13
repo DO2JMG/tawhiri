@@ -1,6 +1,6 @@
 # tawhiri
 
-C port of [Tawhiri](https://github.com/projecthorus/tawhiri) – a high-altitude
+[Tawhiri](https://github.com/projecthorus/tawhiri) programmed in C – a high-altitude
 balloon (radiosonde) trajectory predictor.
 
 
