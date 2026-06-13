@@ -123,10 +123,4 @@ alt > 25 000 m : T = −131.21 + 0.00299·alt   P = 2.488·((T+273.1)/216.6)^−
 
 ---
 
-## Limitations / known differences from original Tawhiri
 
-- **Elevation dataset** (ruaumoko) not yet integrated; descent terminates at
-  altitude = 0 m (sea level) instead of ground level.
-- **Float profile** and **reverse profile** are not exposed via CLI (the model
-  infrastructure supports them; extend `main.c`).
-- No HTTP API (the original `api.py` layer is not ported).
