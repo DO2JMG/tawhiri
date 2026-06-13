@@ -164,7 +164,7 @@ static void run_prediction(int fd, const ServerConfig *cfg,
         { http_error(fd, 400, "Missing or invalid launch_latitude");  return; }
     if (!param_double(params, np, "launch_longitude",  &lng,  -180,   360))
         { http_error(fd, 400, "Missing or invalid launch_longitude"); return; }
-    if (!param_double(params, np, "launch_altitude",   &alt,    0,  10000))
+    if (!param_double(params, np, "launch_altitude",   &alt,    0,  40000))
         { http_error(fd, 400, "Missing or invalid launch_altitude");  return; }
     if (!param_double(params, np, "ascent_rate",       &asc,   0.1,    50))
         { http_error(fd, 400, "Missing or invalid ascent_rate");      return; }
