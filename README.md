@@ -12,6 +12,12 @@ cd tawhiri
 make
 ```
 
+## Create folder
+
+```
+mkdir dataset
+```
+
 ## Start server
 
 ```
