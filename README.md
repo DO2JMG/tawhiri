@@ -78,6 +78,4 @@ Remove old datasets
 30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset --keep-days 1 >> /var/log/tawhiri-gfs.log 2>&1
 ```
 
-The server does not need to be restarted after a successful download when it is
-running without `-d`; it will pick up the newest dataset automatically.
 
