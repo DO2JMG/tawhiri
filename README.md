@@ -21,14 +21,27 @@ mkdir dataset
 ## Start server
 
 ```
-./tawhiri --server --port 8080
+./tawhiri --server --port 8080 --dir ./dataset
+```
+
+Use `--dir PATH` to choose the directory that contains the dataset files.
+If `-d YYYYMMDDHH` is omitted, the server automatically uses the newest dataset
+in that directory and switches to a newer one without restarting when it appears.
+
+To pin a fixed dataset, use:
+
+```
+./tawhiri --server --port 8080 --dir ./dataset -d 2026061112
 ```
 
 ## Run downloader 
 
 ```
-./tawhiri-downloader 2026061112
+./tawhiri-downloader 2026061112 --dir ./dataset
 ```
+
+Use `--dir PATH` to choose where the downloader writes datasets.
+The old environment variable `DATASET_DIR` is still supported.
 
 
 ## Create service (optional)
@@ -42,7 +55,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/root/Tawhiri
-ExecStart=/root/Tawhiri/tawhiri --server --port 65432
+ExecStart=/root/Tawhiri/tawhiri --server --port 65432 --dir /root/Tawhiri/dataset
 Restart=always
 RestartSec=5
 
@@ -58,10 +71,13 @@ systemctl start tawhiri
 
 Download
 ```
-30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader >> /var/log/tawhiri-gfs.log 2>&1 && systemctl restart tawhiri
+30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset >> /var/log/tawhiri-gfs.log 2>&1
 ```
 Remove old datasets
 ```
-30 4,10,16,22 * * * KEEP_DAYS=1 /root/Tawhiri/tawhiri-downloader >> /var/log/tawhiri-gfs.log 2>&1 && systemctl restart tawhiri
+30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset --keep-days 1 >> /var/log/tawhiri-gfs.log 2>&1
 ```
+
+The server does not need to be restarted after a successful download when it is
+running without `-d`; it will pick up the newest dataset automatically.
 
