@@ -67,7 +67,8 @@ Delta model_wind_velocity(double t, double lat, double lng, double alt,
     
     double lng360 = fmod(lng + 360.0, 360.0);
 
-    WindUV w = get_wind(c->ds, c->warn, hour, lat, lng360, alt);
+    WindUV w = get_wind_cached(c->ds, c->warn, &c->cache,
+                               hour, lat, lng360, alt);
 
     double R    = EARTH_R + alt;
     double dlat = _180_PI * w.v / R;

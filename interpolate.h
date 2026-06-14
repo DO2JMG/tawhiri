@@ -18,7 +18,16 @@ typedef struct {
     double v;   
 } WindUV;
 
+typedef struct {
+    int  valid;
+    long altidx;
+} WindInterpCache;
+
 WindUV get_wind(const Dataset *ds, WarningCounts *warn,
                 double hour, double lat, double lng, double alt);
+
+WindUV get_wind_cached(const Dataset *ds, WarningCounts *warn,
+                       WindInterpCache *cache,
+                       double hour, double lat, double lng, double alt);
 
 #endif 

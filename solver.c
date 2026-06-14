@@ -153,7 +153,8 @@ SolverResult *solve(double t0, double lat0, double lng0, double alt0,
     Vec    pos = { lat0, lng0, alt0 };
 
     for (int i = 0; i < n_stages; i++) {
-        Stage s = rk4_stage(t, pos, &stages[i], dt, 0.01);
+        double stage_dt = stages[i].dt > 0.0 ? stages[i].dt : dt;
+        Stage s = rk4_stage(t, pos, &stages[i], stage_dt, 0.01);
         res->stages[i] = s;
 
         

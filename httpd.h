@@ -14,10 +14,13 @@
 typedef struct {
     int                   port;       
     const char           *bind_addr;  
-    const Dataset        *wind_ds;    
+    const char           *dataset_dir;
+    const char           *dataset_name;
+    int                   auto_latest;
     const ElevationDataset *elev_ds;  
     int                   has_elev;
     double                dt;         
+    double                descent_dt; 
 } ServerConfig;
 
 int httpd_run(const ServerConfig *cfg);

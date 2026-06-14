@@ -111,6 +111,10 @@ static uint32_t read_bits(const uint8_t *data, size_t data_len,
 static uint32_t be32(const uint8_t *p) {
     return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
 }
+static int32_t wmo32(const uint8_t *p) {   /* WMO sign-magnitude 32-bit */
+    uint32_t r = be32(p);
+    return (r >> 31) ? -(int32_t)(r & 0x7FFFFFFF) : (int32_t)(r & 0x7FFFFFFF);
+}
 static uint16_t be16(const uint8_t *p) {
     return ((uint16_t)p[0]<<8)|p[1];
 }
@@ -373,7 +377,8 @@ static int process_grib2_file(const char *path, int hour_idx, int out_fd)
         size_t msg_end = pos + total_len;
 
         int disc=-1, cat=-1, num=-1, ltype=-1, level=-1;
-        int ni=0, nj=0, j_pos=0;
+        int ni=0, nj=0, i_neg=0, j_pos=0;
+        int lat_first=0, lon_first=0, lat_last=0, lon_last=0, i_inc=0, j_inc=0;
         const uint8_t *sec5=NULL, *sec7=NULL;
         size_t sec5_len=0, sec7_len=0;
 
@@ -391,7 +396,19 @@ static int process_grib2_file(const char *path, int hour_idx, int out_fd)
             case 3:
                 ni    = (int)be32(fdata+p+30);
                 nj    = (int)be32(fdata+p+34);
-                j_pos = (fdata[p+71] >> 1) & 1;
+                lat_first = wmo32(fdata+p+46);
+                lon_first = (int)be32(fdata+p+50);
+                lat_last  = wmo32(fdata+p+55);
+                lon_last  = (int)be32(fdata+p+59);
+                i_inc     = (int)be32(fdata+p+63);
+                j_inc     = (int)be32(fdata+p+67);
+                /*
+                 * GRIB2 scanning mode uses WMO bit numbering from the MSB:
+                 * bit 1 (0x80): i scans negatively when set
+                 * bit 2 (0x40): j scans positively when set
+                 */
+                i_neg = (fdata[p+71] & 0x80) != 0;
+                j_pos = (fdata[p+71] & 0x40) != 0;
                 break;
             case 4:
                 cat   = fdata[p+9];
@@ -416,6 +433,17 @@ static int process_grib2_file(const char *path, int hour_idx, int out_fd)
         /* Filter: only atmospheric pressure-level fields */
         if (disc != 0 || ltype != 100) continue;
         if (!sec5 || !sec7)            continue;
+        if (!(ni == 720 && nj == 361 &&
+              i_neg == 0 && j_pos == 0 &&
+              lat_first == 90000000 && lon_first == 0 &&
+              lat_last == -90000000 && lon_last == 359500000 &&
+              i_inc == 500000 && j_inc == 500000)) {
+            logmsg("WARNING: unsupported GRIB layout: ni=%d nj=%d i_neg=%d j_pos=%d "
+                   "lat_first=%d lon_first=%d lat_last=%d lon_last=%d i_inc=%d j_inc=%d",
+                   ni, nj, i_neg, j_pos, lat_first, lon_first,
+                   lat_last, lon_last, i_inc, j_inc);
+            continue;
+        }
 
         /* Variable */
         int var_idx = -1;
@@ -450,14 +478,14 @@ static int process_grib2_file(const char *path, int hour_idx, int out_fd)
         if (!grid) continue;
 
         /*
-         * GFS: lat 90→-90 (j_pos=0), Tawhiri needs lat -90→+90 → flip
-         * GFS: lon 0→359.5, Tawhiri: same
+         * Tawhiri dataset order is lat -90→+90 and lon 0→359.5.
+         * Respect the GRIB scan direction flags instead of assuming GFS order.
          */
         float row[DS_LON];
         for (int lat = 0; lat < DS_LAT && lat < nj; lat++) {
             int gfs_lat = (j_pos == 0) ? (nj - 1 - lat) : lat;
             for (int lon = 0; lon < DS_LON && lon < ni; lon++)
-                row[lon] = grid[gfs_lat * ni + lon];
+                row[lon] = grid[gfs_lat * ni + (i_neg ? (ni - 1 - lon) : lon)];
             off_t off = (off_t)DS_IDX(hour_idx, lev_idx, var_idx, lat, 0) * sizeof(float);
             if (pwrite(out_fd, row, DS_LON * sizeof(float), off)
                     != (ssize_t)(DS_LON * sizeof(float))) {
@@ -541,6 +569,22 @@ static void cleanup_old_datasets(const char *dir, int keep_days)
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s [YYYYMMDDHH] [--dir PATH] [--work-dir PATH] "
+        "[--keep-days N] [--check] [--force]\n"
+        "\n"
+        "Options:\n"
+        "  --dir PATH           Dataset output directory (default: DATASET_DIR or ./dataset)\n"
+        "  --dataset-dir PATH   Alias for --dir\n"
+        "  --work-dir PATH      Temporary GRIB work directory (default: WORK_DIR or /tmp/gfs_work)\n"
+        "  --keep-days N        Remove datasets older than N days (default: KEEP_DAYS or 2)\n"
+        "  --check              Only check whether the dataset exists\n"
+        "  --force              Re-download even if the dataset already exists\n",
+        prog);
+}
+
 int main(int argc, char **argv)
 {
     const char *dataset_dir = getenv("DATASET_DIR") ?: DEFAULT_DATASET_DIR;
@@ -553,10 +597,26 @@ int main(int argc, char **argv)
     char run[11] = {0};
 
     for (int i = 1; i < argc; i++) {
-        if      (strcmp(argv[i], "--check") == 0) check_only = 1;
-        else if (strcmp(argv[i], "--force") == 0) force = 1;
-        else if (strlen(argv[i]) == 10) strncpy(run, argv[i], 10);
-        else { fprintf(stderr, "Usage: %s [YYYYMMDDHH] [--check] [--force]\n", argv[0]); return 1; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "--check") == 0) {
+            check_only = 1;
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = 1;
+        } else if ((strcmp(argv[i], "--dir") == 0 ||
+                    strcmp(argv[i], "--dataset-dir") == 0) && i + 1 < argc) {
+            dataset_dir = argv[++i];
+        } else if (strcmp(argv[i], "--work-dir") == 0 && i + 1 < argc) {
+            work_dir = argv[++i];
+        } else if (strcmp(argv[i], "--keep-days") == 0 && i + 1 < argc) {
+            keep_days = atoi(argv[++i]);
+        } else if (strlen(argv[i]) == 10) {
+            strncpy(run, argv[i], 10);
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
     }
 
     if (!run[0]) {
@@ -566,6 +626,8 @@ int main(int argc, char **argv)
         }
     }
     logmsg("GFS run: %s", run);
+    logmsg("Dataset directory: %s", dataset_dir);
+    logmsg("Work directory: %s", work_dir);
 
     char date[9], cycle[4];
     memcpy(date, run, 8); date[8] = '\0';

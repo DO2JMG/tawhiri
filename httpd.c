@@ -17,6 +17,8 @@
 #include <time.h>
 #include <errno.h>
 #include <signal.h>
+#include <dirent.h>
+#include <pthread.h>
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -159,11 +161,178 @@ static void fmt_iso8601(double t, char *buf, size_t len)
     strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", utc);
 }
 
-static void run_prediction(int fd, const ServerConfig *cfg,
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cond;
+    Dataset         ds;
+    char            dir[512];
+    char            current[64];
+    int             auto_latest;
+    int             active;
+    int             reloading;
+    int             valid;
+} DatasetManager;
+
+typedef struct {
+    const Dataset *ds;
+    DatasetManager *mgr;
+} DatasetLease;
+
+static int is_dataset_name(const char *name)
+{
+    if (!name || strlen(name) != 10) return 0;
+    for (int i = 0; i < 10; i++)
+        if (name[i] < '0' || name[i] > '9') return 0;
+    return 1;
+}
+
+static int find_latest_dataset(const char *dir, char out[64])
+{
+    out[0] = '\0';
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (!is_dataset_name(ent->d_name)) continue;
+        if (strcmp(ent->d_name, out) > 0)
+            snprintf(out, 64, "%s", ent->d_name);
+    }
+    closedir(d);
+    return out[0] ? 0 : -1;
+}
+
+static int dm_reload_to(DatasetManager *dm, const char *name)
+{
+    char dir[512];
+
+    pthread_mutex_lock(&dm->mu);
+    if (dm->valid && strcmp(dm->current, name) == 0) {
+        pthread_mutex_unlock(&dm->mu);
+        return 0;
+    }
+    while (dm->reloading)
+        pthread_cond_wait(&dm->cond, &dm->mu);
+    if (dm->valid && strcmp(dm->current, name) == 0) {
+        pthread_mutex_unlock(&dm->mu);
+        return 0;
+    }
+    dm->reloading = 1;
+    while (dm->active > 0)
+        pthread_cond_wait(&dm->cond, &dm->mu);
+    snprintf(dir, sizeof(dir), "%s", dm->dir);
+    pthread_mutex_unlock(&dm->mu);
+
+    Dataset newds;
+    int ok = dataset_open(&newds, name, dir);
+
+    pthread_mutex_lock(&dm->mu);
+    if (ok == 0) {
+        if (dm->valid)
+            dataset_close(&dm->ds);
+        dm->ds = newds;
+        snprintf(dm->current, sizeof(dm->current), "%s", name);
+        dm->valid = 1;
+        fprintf(stderr, "Using dataset: %s\n", dm->current);
+    } else {
+        fprintf(stderr, "WARNING: failed to open dataset %s, keeping %s\n",
+                name, dm->valid ? dm->current : "none");
+    }
+    dm->reloading = 0;
+    pthread_cond_broadcast(&dm->cond);
+    pthread_mutex_unlock(&dm->mu);
+
+    return ok;
+}
+
+static int dm_maybe_reload_latest(DatasetManager *dm)
+{
+    if (!dm->auto_latest) return 0;
+
+    char latest[64];
+    if (find_latest_dataset(dm->dir, latest) < 0) {
+        fprintf(stderr, "WARNING: no dataset found in %s\n", dm->dir);
+        return -1;
+    }
+    return dm_reload_to(dm, latest);
+}
+
+static int dm_init(DatasetManager *dm, const ServerConfig *cfg)
+{
+    memset(dm, 0, sizeof(*dm));
+    pthread_mutex_init(&dm->mu, NULL);
+    pthread_cond_init(&dm->cond, NULL);
+    snprintf(dm->dir, sizeof(dm->dir), "%s", cfg->dataset_dir ? cfg->dataset_dir : "./dataset");
+    dm->auto_latest = cfg->auto_latest;
+
+    char name[64];
+    if (cfg->dataset_name && *cfg->dataset_name) {
+        snprintf(name, sizeof(name), "%s", cfg->dataset_name);
+    } else {
+        if (find_latest_dataset(dm->dir, name) < 0) {
+            fprintf(stderr, "No dataset found in %s\n", dm->dir);
+            return -1;
+        }
+    }
+
+    return dm_reload_to(dm, name);
+}
+
+static void dm_close(DatasetManager *dm)
+{
+    pthread_mutex_lock(&dm->mu);
+    while (dm->active > 0)
+        pthread_cond_wait(&dm->cond, &dm->mu);
+    if (dm->valid)
+        dataset_close(&dm->ds);
+    dm->valid = 0;
+    pthread_mutex_unlock(&dm->mu);
+    pthread_cond_destroy(&dm->cond);
+    pthread_mutex_destroy(&dm->mu);
+}
+
+static int dm_acquire(DatasetManager *dm, DatasetLease *lease)
+{
+    if (dm_maybe_reload_latest(dm) < 0) {
+        pthread_mutex_lock(&dm->mu);
+        int has_valid = dm->valid;
+        pthread_mutex_unlock(&dm->mu);
+        if (!has_valid) return -1;
+    }
+
+    pthread_mutex_lock(&dm->mu);
+    while (dm->reloading)
+        pthread_cond_wait(&dm->cond, &dm->mu);
+    if (!dm->valid) {
+        pthread_mutex_unlock(&dm->mu);
+        return -1;
+    }
+    dm->active++;
+    lease->mgr = dm;
+    lease->ds = &dm->ds;
+    pthread_mutex_unlock(&dm->mu);
+    return 0;
+}
+
+static void dm_release(DatasetLease *lease)
+{
+    if (!lease || !lease->mgr) return;
+    DatasetManager *dm = lease->mgr;
+    pthread_mutex_lock(&dm->mu);
+    if (dm->active > 0)
+        dm->active--;
+    pthread_cond_broadcast(&dm->cond);
+    pthread_mutex_unlock(&dm->mu);
+    lease->mgr = NULL;
+    lease->ds = NULL;
+}
+
+static void run_prediction(int fd, const ServerConfig *cfg, DatasetManager *dm,
                            const Param *params, int np)
 {
     
-    double lat, lng, alt, asc, burst, desc, dt_req;
+    double lat, lng, alt, asc, burst, desc, dt_req, descent_dt_req;
 
     if (!param_double(params, np, "launch_latitude",   &lat,   -90,    90))
         { http_error(fd, 400, "Missing or invalid launch_latitude");  return; }
@@ -180,17 +349,29 @@ static void run_prediction(int fd, const ServerConfig *cfg,
 
     dt_req = cfg->dt;
     param_double(params, np, "dt", &dt_req, 1, 300);
+    descent_dt_req = cfg->descent_dt > 0.0 ? cfg->descent_dt : dt_req;
+    param_double(params, np, "descent_dt", &descent_dt_req, 1, 300);
 
     
     const char *profile_str = param_get(params, np, "profile");
     int is_reverse = (profile_str && strcmp(profile_str, "reverse_profile") == 0);
 
-    
-    double t0 = (double)cfg->wind_ds->ds_time;
+    DatasetLease lease = { 0 };
+    if (dm_acquire(dm, &lease) < 0) {
+        http_error(fd, 500, "No wind dataset available");
+        return;
+    }
+    const Dataset *wind_ds = lease.ds;
+
+    double t0 = (double)wind_ds->ds_time;
     const char *ldt = param_get(params, np, "launch_datetime");
     if (ldt && *ldt) {
         time_t ts = parse_iso8601(ldt);
-        if (ts < 0) { http_error(fd, 400, "Invalid launch_datetime"); return; }
+        if (ts < 0) {
+            dm_release(&lease);
+            http_error(fd, 400, "Invalid launch_datetime");
+            return;
+        }
         t0 = (double)ts;
     }
 
@@ -200,7 +381,7 @@ static void run_prediction(int fd, const ServerConfig *cfg,
     
     WarningCounts warn = { 0 };
     ConstAscentCtx asc_ctx  = { asc };
-    WindCtx        wind_ctx = { cfg->wind_ds, &warn, cfg->wind_ds->ds_time };
+    WindCtx        wind_ctx = { wind_ds, &warn, wind_ds->ds_time, { 0, 0 } };
 
     LinearModelCtx up_model = {
         .n    = 2,
@@ -218,51 +399,48 @@ static void run_prediction(int fd, const ServerConfig *cfg,
 
     BurstCtx       burst_ctx = { burst };
     DragDescentCtx drag_ctx;
+    LinearModelCtx down_model;
+    LinearModelCtx rev_model;
+    MinTimeCtx     min_time_ctx;
+    TerminatorFn   rev_fns[2];
+    void          *rev_ctxs[2];
+    AnyTermCtx     any_ctx;
 
     if (!is_reverse) {
         make_drag_ctx(&drag_ctx, desc);
-        LinearModelCtx down_model = {
+        down_model = (LinearModelCtx){
             .n    = 2,
             .fns  = { model_drag_descent, model_wind_velocity },
             .ctxs = { &drag_ctx, &wind_ctx }
         };
-        static LinearModelCtx down_static;
-        down_static = down_model;
-
-        stages[0] = (FlightStage){ model_linear, &up_model,    term_burst, &burst_ctx, 0 };
-        stages[1] = (FlightStage){ model_linear, &down_static, land_term,  land_ctx,   0 };
+        stages[0] = (FlightStage){ model_linear, &up_model,    term_burst, &burst_ctx, 0, dt_req };
+        stages[1] = (FlightStage){ model_linear, &down_model,  land_term,  land_ctx,   0, descent_dt_req };
         n_stages       = 2;
         stage_names[0] = "ascent";
         stage_names[1] = "descent";
     } else {
-        static LinearModelCtx rev_model;
         rev_model = (LinearModelCtx){
             .n    = 2,
             .fns  = { model_constant_ascent, model_wind_velocity },
             .ctxs = { &asc_ctx, &wind_ctx }
         };
-        MinTimeCtx min_time_ctx = { (double)cfg->wind_ds->ds_time };
-        static TerminatorFn rev_fns[2];
-        static void *rev_ctxs[2];
-        static MinTimeCtx min_ctx_s;
-        min_ctx_s = min_time_ctx;
+        min_time_ctx = (MinTimeCtx){ (double)wind_ds->ds_time };
         rev_fns[0]  = land_term; rev_ctxs[0] = land_ctx;
-        rev_fns[1]  = term_min_time; rev_ctxs[1] = &min_ctx_s;
-        static AnyTermCtx any_ctx;
+        rev_fns[1]  = term_min_time; rev_ctxs[1] = &min_time_ctx;
         any_ctx = (AnyTermCtx){ 2, rev_fns, rev_ctxs };
-        stages[0] = (FlightStage){ model_linear, &rev_model, term_any, &any_ctx, 1 };
+        stages[0] = (FlightStage){ model_linear, &rev_model, term_any, &any_ctx, 1, dt_req };
         n_stages       = 1;
         stage_names[0] = "reverse_ascent";
     }
 
     SolverResult *result = solve(t0, lat, lng_norm, alt, stages, n_stages, dt_req);
-    if (!result) { http_error(fd, 500, "Solver allocation failure"); return; }
+    if (!result) { dm_release(&lease); http_error(fd, 500, "Solver allocation failure"); return; }
 
     
     char *json = NULL;
     size_t jlen = 0;
     FILE *jf = open_memstream(&json, &jlen);
-    if (!jf) { solver_result_free(result); http_error(fd, 500, "open_memstream failed"); return; }
+    if (!jf) { dm_release(&lease); solver_result_free(result); http_error(fd, 500, "open_memstream failed"); return; }
 
     
     char ts_now[40];
@@ -276,7 +454,7 @@ static void run_prediction(int fd, const ServerConfig *cfg,
         snprintf(ts_now, sizeof(ts_now), "%s.%06dZ", base, (int)(tp.tv_nsec/1000));
     }
     char ds_dt[32], launch_dt[32];
-    fmt_iso8601((double)cfg->wind_ds->ds_time, ds_dt, sizeof(ds_dt));
+    fmt_iso8601((double)wind_ds->ds_time, ds_dt, sizeof(ds_dt));
     fmt_iso8601(t0, launch_dt, sizeof(launch_dt));
 
     fprintf(jf, "{\n");
@@ -309,6 +487,7 @@ static void run_prediction(int fd, const ServerConfig *cfg,
     fprintf(jf, "    \"burst_altitude\":%.6g,\n",   burst);
     fprintf(jf, "    \"dataset\":\"%s\",\n",         ds_dt);
     fprintf(jf, "    \"descent_rate\":%.6g,\n",     desc);
+    fprintf(jf, "    \"descent_dt\":%.6g,\n",       descent_dt_req);
     fprintf(jf, "    \"format\":\"json\",\n");
     fprintf(jf, "    \"launch_altitude\":%.6g,\n",  alt);
     fprintf(jf, "    \"launch_datetime\":\"%s\",\n", launch_dt);
@@ -328,6 +507,7 @@ static void run_prediction(int fd, const ServerConfig *cfg,
     fprintf(jf, "}\n}\n");
     fclose(jf);
 
+    dm_release(&lease);
     solver_result_free(result);
 
     
@@ -343,7 +523,7 @@ static void run_prediction(int fd, const ServerConfig *cfg,
     free(json);
 }
 
-static void handle_request(int fd, const ServerConfig *cfg)
+static void handle_request(int fd, const ServerConfig *cfg, DatasetManager *dm)
 {
     
     char req[4096] = {0};
@@ -384,10 +564,8 @@ static void handle_request(int fd, const ServerConfig *cfg)
     Param params[MAX_PARAMS];
     int np = parse_query(qs, params, MAX_PARAMS);
 
-    run_prediction(fd, cfg, params, np);
+    run_prediction(fd, cfg, dm, params, np);
 }
-
-#include <pthread.h>
 
 #define POOL_THREADS   16      
 #define QUEUE_SIZE     64      
@@ -400,6 +578,7 @@ typedef struct {
     pthread_cond_t  not_full;
     int             stop;
     const ServerConfig *cfg;
+    DatasetManager *dm;
 } WorkQueue;
 
 static void wq_push(WorkQueue *q, int fd)
@@ -441,7 +620,7 @@ static void *worker_thread(void *arg)
     for (;;) {
         int fd = wq_pop(q);
         if (fd < 0) break;   
-        handle_request(fd, q->cfg);
+        handle_request(fd, q->cfg, q->dm);
         close(fd);
     }
     return NULL;
@@ -461,8 +640,12 @@ int httpd_run(const ServerConfig *cfg)
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
+    DatasetManager dm;
+    if (dm_init(&dm, cfg) < 0)
+        return -1;
+
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { perror("socket"); return -1; }
+    if (srv < 0) { perror("socket"); dm_close(&dm); return -1; }
 
     int opt = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -474,16 +657,17 @@ int httpd_run(const ServerConfig *cfg)
     addr.sin_addr.s_addr = inet_addr(cfg->bind_addr ? cfg->bind_addr : "0.0.0.0");
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(srv); return -1;
+        perror("bind"); close(srv); dm_close(&dm); return -1;
     }
     if (listen(srv, 128) < 0) {
-        perror("listen"); close(srv); return -1;
+        perror("listen"); close(srv); dm_close(&dm); return -1;
     }
 
     
     WorkQueue q;
     memset(&q, 0, sizeof(q));
     q.cfg = cfg;
+    q.dm = &dm;
     pthread_mutex_init(&q.mu, NULL);
     pthread_cond_init(&q.not_empty, NULL);
     pthread_cond_init(&q.not_full,  NULL);
@@ -497,6 +681,10 @@ int httpd_run(const ServerConfig *cfg)
         "(%d worker threads, queue depth %d)\n",
         cfg->bind_addr ? cfg->bind_addr : "0.0.0.0",
         cfg->port, POOL_THREADS, QUEUE_SIZE);
+    fprintf(stderr, "Dataset mode: %s%s%s\n",
+        cfg->auto_latest ? "auto-latest in " : "fixed ",
+        cfg->auto_latest ? dm.dir : dm.current,
+        cfg->auto_latest ? "" : "");
     fprintf(stderr,
         "Example: http://localhost:%d/?launch_latitude=51.5"
         "&launch_longitude=8.1&launch_altitude=100"
@@ -538,6 +726,7 @@ int httpd_run(const ServerConfig *cfg)
     pthread_cond_destroy(&q.not_full);
 
     close(srv);
+    dm_close(&dm);
     fprintf(stderr, "\ntawhiri-c server stopped.\n");
     return 0;
 }

@@ -26,6 +26,7 @@ typedef struct {
     const Dataset  *ds;
     WarningCounts  *warn;
     time_t          dataset_epoch;
+    WindInterpCache cache;
 } WindCtx;
 
 #define MAX_SUBMODELS 4

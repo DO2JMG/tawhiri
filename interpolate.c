@@ -99,6 +99,42 @@ static long search_level(const Dataset *ds, const Lerp3 corners[8],
     return lower;
 }
 
+static long search_level_near(const Dataset *ds, const Lerp3 corners[8],
+                              double alt, WindInterpCache *cache,
+                              double *lower_h, double *upper_h)
+{
+    long idx;
+
+    if (cache && cache->valid &&
+        cache->altidx >= 0 && cache->altidx < DS_LEVELS - 1) {
+        idx = cache->altidx;
+    } else {
+        idx = search_level(ds, corners, alt);
+    }
+
+    for (;;) {
+        double lo = interp3(ds, corners, VAR_HEIGHT, (int)idx);
+        double hi = interp3(ds, corners, VAR_HEIGHT, (int)idx + 1);
+
+        if (idx > 0 && alt <= lo) {
+            idx--;
+            continue;
+        }
+        if (idx < DS_LEVELS - 2 && alt > hi) {
+            idx++;
+            continue;
+        }
+
+        *lower_h = lo;
+        *upper_h = hi;
+        if (cache) {
+            cache->valid = 1;
+            cache->altidx = idx;
+        }
+        return idx;
+    }
+}
+
 static double interp4(const Dataset *ds, const Lerp3 corners[8],
                       Lerp1 alt_lerp, int variable)
 {
@@ -110,17 +146,22 @@ static double interp4(const Dataset *ds, const Lerp3 corners[8],
 WindUV get_wind(const Dataset *ds, WarningCounts *warn,
                 double hour, double lat, double lng, double alt)
 {
+    return get_wind_cached(ds, warn, NULL, hour, lat, lng, alt);
+}
+
+WindUV get_wind_cached(const Dataset *ds, WarningCounts *warn,
+                       WindInterpCache *cache,
+                       double hour, double lat, double lng, double alt)
+{
     WindUV result = {0.0, 0.0};
 
     Lerp3 corners[8];
     if (pick3(hour, lat, lng, corners) < 0)
         return result;   
 
-    
-    long altidx = search_level(ds, corners, alt);
-
-    double lower_h = interp3(ds, corners, VAR_HEIGHT, (int)altidx);
-    double upper_h = interp3(ds, corners, VAR_HEIGHT, (int)altidx + 1);
+    double lower_h, upper_h;
+    long altidx = search_level_near(ds, corners, alt, cache,
+                                    &lower_h, &upper_h);
 
     double lerp_alt;
     if (lower_h != upper_h)

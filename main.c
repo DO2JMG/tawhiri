@@ -43,6 +43,11 @@ static int arg_flag(int argc, char **argv, const char *key)
     return 0;
 }
 
+static double descent_dt_default(double dt)
+{
+    return dt;
+}
+
 static void format_iso8601(double t, char *buf, size_t len)
 {
     time_t tt = (time_t)t;
@@ -74,38 +79,11 @@ int main(int argc, char **argv)
         int found;
         int port = (int)arg_dbl(argc, argv, "--port", 8080, &found);
         double dt = arg_dbl(argc, argv, "--dt", 60.0, NULL);
+        double descent_dt = arg_dbl(argc, argv, "--descent-dt",
+                                    descent_dt_default(dt), NULL);
 
         
-        char ds_auto[64] = {0};
-        if (!ds_str) {
-            const char *search_dir = dir ? dir : "./dataset";
-            DIR *d = opendir(search_dir);
-            if (!d) {
-                fprintf(stderr, "Cannot open dataset directory: %s\n", search_dir);
-                return 1;
-            }
-            struct dirent *ent;
-            while ((ent = readdir(d)) != NULL) {
-                if (strlen(ent->d_name) == 10) {
-                    int all_digits = 1;
-                    for (int i = 0; i < 10; i++)
-                        if (ent->d_name[i] < '0' || ent->d_name[i] > '9')
-                            { all_digits = 0; break; }
-                    if (all_digits && strcmp(ent->d_name, ds_auto) > 0)
-                        strncpy(ds_auto, ent->d_name, sizeof(ds_auto)-1);
-                }
-            }
-            closedir(d);
-            if (!ds_auto[0]) {
-                fprintf(stderr, "No dataset found in %s\n", search_dir);
-                return 1;
-            }
-            ds_str = ds_auto;
-            fprintf(stderr, "Using dataset: %s\n", ds_str);
-        }
-
-        Dataset ds;
-        if (dataset_open(&ds, ds_str, dir) < 0) return 1;
+        int auto_latest = (ds_str == NULL);
 
         ElevationDataset el;
         int has_el = 0;
@@ -115,16 +93,18 @@ int main(int argc, char **argv)
         }
 
         ServerConfig cfg = {
-            .port      = port,
-            .bind_addr = bind,
-            .wind_ds   = &ds,
-            .elev_ds   = has_el ? &el : NULL,
+            .port         = port,
+            .bind_addr    = bind,
+            .dataset_dir  = dir ? dir : "./dataset",
+            .dataset_name = ds_str,
+            .auto_latest  = auto_latest,
+            .elev_ds      = has_el ? &el : NULL,
             .has_elev  = has_el,
             .dt        = dt,
+            .descent_dt = descent_dt,
         };
 
         int ret = httpd_run(&cfg);
-        dataset_close(&ds);
         if (has_el) elevation_close(&el);
         return ret;
     }
@@ -134,12 +114,13 @@ int main(int argc, char **argv)
             "CLI mode:\n"
             "  tawhiri-c -d YYYYMMDDHH --lat L --lng G --alt A\n"
             "            --asc R --burst B --desc D\n"
-            "            [--dir PATH] [--time T] [--dt SECS] [--csv]\n"
+            "            [--dir PATH] [--time T] [--dt SECS] [--descent-dt SECS] [--csv]\n"
             "            [--profile standard_profile|reverse_profile]\n"
             "\n"
             "Server mode:\n"
             "  tawhiri-c --server [--port 8080] [--bind 0.0.0.0]\n"
-            "            [-d YYYYMMDDHH] [--dir PATH] [--dt SECS]\n"
+            "            [-d YYYYMMDDHH] [--dir PATH] [--dt SECS] [--descent-dt SECS]\n"
+            "            (without -d, the newest dataset in --dir is used and auto-reloaded)\n"
             "\n"
             "  GET /?launch_latitude=51.5&launch_longitude=8.1\n"
             "       &launch_altitude=100&ascent_rate=5\n"
@@ -168,6 +149,8 @@ int main(int argc, char **argv)
     double descent_rate  = arg_dbl(argc, argv, "--desc",  6, &found);
     int    has_desc      = found;
     double dt            = arg_dbl(argc, argv, "--dt",    60.0, NULL);
+    double descent_dt    = arg_dbl(argc, argv, "--descent-dt",
+                                   descent_dt_default(dt), NULL);
     int    csv_mode      = arg_flag(argc, argv, "--csv");
     const char *profile  = arg_str(argc, argv, "--profile", "standard_profile");
     const char *elev_path = arg_str(argc, argv, "--elev", NULL);  
@@ -223,7 +206,7 @@ int main(int argc, char **argv)
 
     
     ConstAscentCtx asc_ctx  = { ascent_rate };
-    WindCtx        wind_ctx = { &ds, &warn, ds.ds_time };
+    WindCtx        wind_ctx = { &ds, &warn, ds.ds_time, { 0, 0 } };
 
     
     FlightStage    stages[2];
@@ -232,6 +215,12 @@ int main(int argc, char **argv)
 
     BurstCtx       burst_ctx = { burst_alt };
     DragDescentCtx drag_ctx;
+    LinearModelCtx down_model;
+    LinearModelCtx rev_model;
+    MinTimeCtx     min_time_ctx;
+    TerminatorFn   rev_terms[2];
+    void          *rev_term_ctxs[2];
+    AnyTermCtx     any_ctx;
 
     
     LinearModelCtx up_model = {
@@ -243,24 +232,20 @@ int main(int argc, char **argv)
     if (is_standard) {
         make_drag_ctx(&drag_ctx, descent_rate);
 
-        LinearModelCtx down_model = {
+        down_model = (LinearModelCtx){
             .n    = 2,
             .fns  = { model_drag_descent, model_wind_velocity },
             .ctxs = { &drag_ctx, &wind_ctx }
         };
 
-        static LinearModelCtx down_model_static;
-        down_model_static = down_model;
-
-        stages[0] = (FlightStage){ model_linear, &up_model,          term_burst,  &burst_ctx, 0 };
-        stages[1] = (FlightStage){ model_linear, &down_model_static,  land_term,   land_ctx,   0 };
+        stages[0] = (FlightStage){ model_linear, &up_model,          term_burst,  &burst_ctx, 0, dt };
+        stages[1] = (FlightStage){ model_linear, &down_model,         land_term,   land_ctx,   0, descent_dt };
         n_stages       = 2;
         stage_names[0] = "ascent";
         stage_names[1] = "descent";
 
     } else {
         
-        static LinearModelCtx rev_model;
         rev_model = (LinearModelCtx){
             .n    = 2,
             .fns  = { model_constant_ascent, model_wind_velocity },
@@ -268,19 +253,15 @@ int main(int argc, char **argv)
         };
 
         
-        static MinTimeCtx min_time_ctx;
-        min_time_ctx.min_time = (double)ds.ds_time;
+        min_time_ctx = (MinTimeCtx){ (double)ds.ds_time };
 
         
-        static TerminatorFn rev_terms[2];
-        static void        *rev_term_ctxs[2];
         rev_terms[0]    = land_term;   rev_term_ctxs[0] = land_ctx;
         rev_terms[1]    = term_min_time;  rev_term_ctxs[1] = &min_time_ctx;
 
-        static AnyTermCtx any_ctx;
         any_ctx = (AnyTermCtx){ 2, rev_terms, rev_term_ctxs };
 
-        stages[0] = (FlightStage){ model_linear, &rev_model, term_any, &any_ctx, 1 };
+        stages[0] = (FlightStage){ model_linear, &rev_model, term_any, &any_ctx, 1, dt };
         n_stages       = 1;
         stage_names[0] = "reverse_ascent";
     }
@@ -365,6 +346,7 @@ int main(int argc, char **argv)
         printf("    \"burst_altitude\":%.6g,\n",  burst_alt);
         printf("    \"dataset\":\"%s\",\n",        ds_dt);
         printf("    \"descent_rate\":%.6g,\n",    descent_rate);
+        printf("    \"descent_dt\":%.6g,\n",      descent_dt);
         printf("    \"format\":\"json\",\n");
         printf("    \"launch_altitude\":%.6g,\n", alt0);
         printf("    \"launch_datetime\":\"%s\",\n", launch_dt);

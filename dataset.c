@@ -99,8 +99,16 @@ int dataset_open(Dataset *ds, const char *ds_time_str, const char *directory)
         return -1;
     }
 
-    madvise(ptr, DS_SIZE, MADV_RANDOM);
-    madvise(ptr, DS_SIZE, MADV_WILLNEED);
+    /*
+     * Do not advise MADV_RANDOM here. A balloon trajectory has spatial and
+     * temporal locality in the forecast grid, so the kernel's default mmap
+     * readahead/page-cache behavior is usually better for first-request
+     * latency than disabling readahead.
+     *
+     * Also avoid MADV_WILLNEED for the whole multi-GB dataset: pulling the
+     * complete file into cache at startup is too coarse and can make cold
+     * starts or dataset switches unnecessarily expensive.
+     */
 
     ds->mmap_ptr = ptr;
     ds->mmap_len = DS_SIZE;

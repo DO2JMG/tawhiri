@@ -28,6 +28,7 @@ typedef struct {
     TerminatorFn terminator;
     void        *term_ctx;
     int          reverse;    
+    double       dt;         
 } FlightStage;
 
 typedef struct {
