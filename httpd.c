@@ -342,7 +342,7 @@ static void run_prediction(int fd, const ServerConfig *cfg, DatasetManager *dm,
         { http_error(fd, 400, "Missing or invalid launch_altitude");  return; }
     if (!param_double(params, np, "ascent_rate",       &asc,   0.1,    50))
         { http_error(fd, 400, "Missing or invalid ascent_rate");      return; }
-    if (!param_double(params, np, "burst_altitude",    &burst, 1000, 50000))
+    if (!param_double(params, np, "burst_altitude",    &burst, 200, 50000))
         { http_error(fd, 400, "Missing or invalid burst_altitude");   return; }
     if (!param_double(params, np, "descent_rate",      &desc,  0.1,    50))
         { http_error(fd, 400, "Missing or invalid descent_rate");     return; }
@@ -474,7 +474,7 @@ static void run_prediction(int fd, const ServerConfig *cfg, DatasetManager *dm,
             double lo = p->lng > 180.0 ? p->lng - 360.0 : p->lng;
             fprintf(jf,
                 "      {\"altitude\":%.6g,\"datetime\":\"%s\","
-                "\"latitude\":%.6g,\"longitude\":%.6g}%s\n",
+                "\"latitude\":%.5g,\"longitude\":%.5g}%s\n",
                 p->alt, ts, p->lat, lo,
                 (i == st->n - 1) ? "" : ",");
         }
@@ -491,8 +491,8 @@ static void run_prediction(int fd, const ServerConfig *cfg, DatasetManager *dm,
     fprintf(jf, "    \"format\":\"json\",\n");
     fprintf(jf, "    \"launch_altitude\":%.6g,\n",  alt);
     fprintf(jf, "    \"launch_datetime\":\"%s\",\n", launch_dt);
-    fprintf(jf, "    \"launch_latitude\":%.6g,\n",  lat);
-    fprintf(jf, "    \"launch_longitude\":%.6g,\n", lng);
+    fprintf(jf, "    \"launch_latitude\":%.5g,\n",  lat);
+    fprintf(jf, "    \"launch_longitude\":%.5g,\n", lng);
     fprintf(jf, "    \"profile\":\"%s\",\n",
             is_reverse ? "reverse_profile" : "standard_profile");
     fprintf(jf, "    \"version\":1\n");
