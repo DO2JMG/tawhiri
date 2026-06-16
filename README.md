@@ -34,7 +34,7 @@ To pin a fixed dataset, use:
 ./tawhiri --server --port 8080 --dir ./dataset -d 2026061112
 ```
 
-## Run downloader 
+## Run downloader
 
 ```
 ./tawhiri-downloader 2026061112 --dir ./dataset
@@ -43,6 +43,36 @@ To pin a fixed dataset, use:
 Use `--dir PATH` to choose where the downloader writes datasets.
 The old environment variable `DATASET_DIR` is still supported.
 
+### Download source
+
+The downloader supports multiple download sources:
+
+```
+./tawhiri-downloader --source auto --dir ./dataset
+./tawhiri-downloader --source amazonaws --dir ./dataset
+./tawhiri-downloader --source noaa --dir ./dataset
+```
+
+Available sources:
+
+- `auto` – default; try Amazon AWS first, then NOAA/NOMADS as fallback
+- `amazonaws` – use the NOAA GFS public AWS S3 bucket
+- `noaa` – use NOAA/NOMADS
+
+With a fixed GFS run:
+
+```
+./tawhiri-downloader 2026061112 --source auto --dir ./dataset
+```
+
+Other useful options:
+
+```
+./tawhiri-downloader --dir ./dataset --keep-days 1
+./tawhiri-downloader --dir ./dataset --work-dir /tmp/gfs_work
+./tawhiri-downloader --dir ./dataset --check
+./tawhiri-downloader --dir ./dataset --force
+```
 
 ## Create service (optional)
 
@@ -69,13 +99,26 @@ systemctl start tawhiri
 
 ## Create Cronjobs (optional)
 
-Download
+Download using the default source mode (`auto`):
+
 ```
-30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset >> /var/log/tawhiri-gfs.log 2>&1
-```
-Remove old datasets
-```
-30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset --keep-days 1 >> /var/log/tawhiri-gfs.log 2>&1
+30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset --source auto >> /var/log/tawhiri-gfs.log 2>&1
 ```
 
+Download using Amazon AWS only:
 
+```
+30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset --source amazonaws >> /var/log/tawhiri-gfs.log 2>&1
+```
+
+Download using NOAA/NOMADS only:
+
+```
+30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset --source noaa >> /var/log/tawhiri-gfs.log 2>&1
+```
+
+Remove old datasets:
+
+```
+30 4,10,16,22 * * * /root/Tawhiri/tawhiri-downloader --dir /root/Tawhiri/dataset --source auto --keep-days 1 >> /var/log/tawhiri-gfs.log 2>&1
+```
