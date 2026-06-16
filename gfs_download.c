@@ -24,7 +24,54 @@
 #define DEFAULT_DATASET_DIR   "./dataset"
 #define DEFAULT_WORK_DIR      "/tmp/gfs_work"
 #define DEFAULT_KEEP_DAYS     2
-#define NOAA_BASE  "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod"
+#define NOAA_NOMADS_BASE  "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod"
+#define NOAA_S3_BASE      "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+
+
+typedef enum {
+    SOURCE_AUTO = 0,
+    SOURCE_AMAZONAWS,
+    SOURCE_NOAA
+} SourceMode;
+
+static const char *source_name(SourceMode src)
+{
+    switch (src) {
+    case SOURCE_AMAZONAWS: return "amazonaws";
+    case SOURCE_NOAA:      return "noaa";
+    case SOURCE_AUTO:   return "auto";
+    }
+    return "auto";
+}
+
+static const char *source_base(SourceMode src)
+{
+    switch (src) {
+    case SOURCE_AMAZONAWS:     return NOAA_S3_BASE;
+    case SOURCE_NOAA: return NOAA_NOMADS_BASE;
+    case SOURCE_AUTO:   return NOAA_S3_BASE;
+    }
+    return NOAA_S3_BASE;
+}
+
+static int parse_source(const char *s, SourceMode *out)
+{
+    if (strcmp(s, "auto") == 0)   { *out = SOURCE_AUTO;   return 1; }
+    if (strcmp(s, "amazonaws") == 0) { *out = SOURCE_AMAZONAWS; return 1; }
+    if (strcmp(s, "noaa") == 0)      { *out = SOURCE_NOAA;      return 1; }
+    return 0;
+}
+
+static void build_gfs_url(char *url, size_t len, SourceMode src,
+                          const char *date, const char *cycle,
+                          const char *ftype, const char *fff,
+                          int idx_file)
+{
+    snprintf(url, len,
+        "%s/gfs.%s/%s/atmos/gfs.t%sz.%s.0p50.f%s%s",
+        source_base(src), date, cycle, cycle, ftype, fff,
+        idx_file ? ".idx" : "");
+}
 
 #define DS_HOURS    65
 #define DS_LEVELS   47
@@ -502,7 +549,25 @@ static int process_grib2_file(const char *path, int hour_idx, int out_fd)
 
 /* ── Find latest GFS run ─────────────────────────────────────────────────── */
 
-static int find_latest_run(char run_out[11])
+static int run_available(SourceMode src, const char *date, const char *cyc)
+{
+    char url000[512], url192[512];
+
+    build_gfs_url(url000, sizeof(url000), src, date, cyc, "pgrb2", "000", 0);
+    build_gfs_url(url192, sizeof(url192), src, date, cyc, "pgrb2", "192", 0);
+
+    return curl_head_exists(url000) && curl_head_exists(url192);
+}
+
+static int run_available_any(SourceMode mode, const char *date, const char *cyc)
+{
+    if (mode == SOURCE_AUTO)
+        return run_available(SOURCE_AMAZONAWS, date, cyc) ||
+               run_available(SOURCE_NOAA, date, cyc);
+    return run_available(mode, date, cyc);
+}
+
+static int find_latest_run(char run_out[11], SourceMode source)
 {
     time_t now = time(NULL);
     for (int offset_h = 4; offset_h <= 16; offset_h++) {
@@ -513,21 +578,36 @@ static int find_latest_run(char run_out[11])
         strftime(date, sizeof(date), "%Y%m%d", tm);
         snprintf(cyc, sizeof(cyc), "%02d", cycle);
 
-        /* Verify f000 AND f192 both exist – ensures run is complete */
-        char url000[512], url192[512];
-        snprintf(url000, sizeof(url000),
-            "%s/gfs.%s/%s/atmos/gfs.t%sz.pgrb2.0p50.f000",
-            NOAA_BASE, date, cyc, cyc);
-        snprintf(url192, sizeof(url192),
-            "%s/gfs.%s/%s/atmos/gfs.t%sz.pgrb2.0p50.f192",
-            NOAA_BASE, date, cyc, cyc);
-
-        if (curl_head_exists(url000) && curl_head_exists(url192)) {
+        /* Verify f000 AND f192 both exist – ensures run is complete. */
+        if (run_available_any(source, date, cyc)) {
             snprintf(run_out, 11, "%s%s", date, cyc);
             return 1;
         }
     }
     return 0;
+}
+
+static int download_from_source(SourceMode src, const char *date,
+                                const char *cycle, const char *ftype,
+                                const char *fff, const char *outfile)
+{
+    char url[512];
+    build_gfs_url(url, sizeof(url), src, date, cycle, ftype, fff, 0);
+    return curl_download(url, outfile);
+}
+
+static int download_gfs_file(SourceMode mode, const char *date,
+                             const char *cycle, const char *ftype,
+                             const char *fff, const char *outfile)
+{
+    if (mode == SOURCE_AUTO) {
+        if (download_from_source(SOURCE_AMAZONAWS, date, cycle, ftype, fff, outfile) == 0)
+            return 0;
+        logmsg("amazonaws download failed for %s f%s, trying noaa", ftype, fff);
+        return download_from_source(SOURCE_NOAA, date, cycle, ftype, fff, outfile);
+    }
+
+    return download_from_source(mode, date, cycle, ftype, fff, outfile);
 }
 
 /* ── Filesystem helpers ──────────────────────────────────────────────────── */
@@ -569,19 +649,20 @@ static void cleanup_old_datasets(const char *dir, int keep_days)
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [YYYYMMDDHH] [--dir PATH] [--work-dir PATH] "
-        "[--keep-days N] [--check] [--force]\n"
+        "[--keep-days N] [--source auto|amazonaws|noaa] [--check] [--force]\n"
         "\n"
         "Options:\n"
-        "  --dir PATH           Dataset output directory (default: DATASET_DIR or ./dataset)\n"
-        "  --dataset-dir PATH   Alias for --dir\n"
-        "  --work-dir PATH      Temporary GRIB work directory (default: WORK_DIR or /tmp/gfs_work)\n"
-        "  --keep-days N        Remove datasets older than N days (default: KEEP_DAYS or 2)\n"
-        "  --check              Only check whether the dataset exists\n"
-        "  --force              Re-download even if the dataset already exists\n",
+        "  --dir PATH             Dataset output directory (default: DATASET_DIR or ./dataset)\n"
+        "  --work-dir PATH        Temporary GRIB work directory (default: WORK_DIR or /tmp/gfs_work)\n"
+        "  --keep-days N          Remove datasets older than N days (default: KEEP_DAYS or 2)\n"
+        "  --source SOURCE        Download source: auto, amazonaws, or noaa (default: auto)\n"
+        "  --check                Only check whether the dataset exists\n"
+        "  --force                Re-download even if the dataset already exists\n",
         prog);
 }
 
@@ -594,6 +675,7 @@ int main(int argc, char **argv)
     if (kd) keep_days = atoi(kd);
 
     int check_only = 0, force = 0;
+    SourceMode source = SOURCE_AUTO;
     char run[11] = {0};
 
     for (int i = 1; i < argc; i++) {
@@ -604,13 +686,17 @@ int main(int argc, char **argv)
             check_only = 1;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = 1;
-        } else if ((strcmp(argv[i], "--dir") == 0 ||
-                    strcmp(argv[i], "--dataset-dir") == 0) && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) {
             dataset_dir = argv[++i];
         } else if (strcmp(argv[i], "--work-dir") == 0 && i + 1 < argc) {
             work_dir = argv[++i];
         } else if (strcmp(argv[i], "--keep-days") == 0 && i + 1 < argc) {
             keep_days = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
+            if (!parse_source(argv[++i], &source)) {
+                usage(argv[0]);
+                return 1;
+            }
         } else if (strlen(argv[i]) == 10) {
             strncpy(run, argv[i], 10);
         } else {
@@ -621,11 +707,12 @@ int main(int argc, char **argv)
 
     if (!run[0]) {
         logmsg("Searching for latest available GFS run...");
-        if (!find_latest_run(run)) {
+        if (!find_latest_run(run, source)) {
             fprintf(stderr, "No available GFS run found.\n"); return 1;
         }
     }
     logmsg("GFS run: %s", run);
+    logmsg("Download source: %s", source_name(source));
     logmsg("Dataset directory: %s", dataset_dir);
     logmsg("Work directory: %s", work_dir);
 
@@ -678,16 +765,12 @@ int main(int argc, char **argv)
             if (stat(grib_path, &st) == 0 && st.st_size > 100000) goto process;
 
             {
-                char url[512];
-                snprintf(url, sizeof(url),
-                    "%s/gfs.%s/%s/atmos/gfs.t%sz.%s.0p50.f%s",
-                    NOAA_BASE, date, cycle, cycle, ftype, fff);
                 char tmp_path[660];
                 snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", grib_path);
                 int ok = 0;
                 for (int retry = 0; retry < 3 && !ok; retry++) {
                     if (retry > 0) sleep(10 * retry);
-                    if (curl_download(url, tmp_path) == 0) {
+                    if (download_gfs_file(source, date, cycle, ftype, fff, tmp_path) == 0) {
                         rename(tmp_path, grib_path);
                         ok = 1;
                     }
